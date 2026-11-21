@@ -5274,3 +5274,87 @@ func (lingerDialer) Dial(network, address string) (net.Conn, error) {
 	}
 	return c, nil
 }
+
+// Every pending callout request on an account answers through one shared wildcard
+// subscription, not one subscription per request, and nothing stays registered once a
+// request is done. The shared subscription is made again if the account's internal
+// client was replaced.
+func TestAuthCalloutRepliesShareOneSubscription(t *testing.T) {
+	conf := `
+		listen: "127.0.0.1:-1"
+		server_name: A
+		authorization {
+			timeout: 5s
+			users: [ { user: "auth", password: "pwd" } ]
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				auth_users: [ auth ]
+			}
+		}
+	`
+	callouts := uint32(0)
+	handler := func(m *nats.Msg) {
+		atomic.AddUint32(&callouts, 1)
+		user, si, _, opts, _ := decodeAuthRequest(t, m.Data)
+		if opts.Username == "dlc" && opts.Password == "zzz" {
+			ujwt := createAuthUser(t, user, _EMPTY_, globalAccountName, "", nil, 10*time.Minute, nil)
+			m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+			return
+		}
+		m.Respond(nil) // no reason supplied: not authorized
+	}
+	at := NewAuthTest(t, conf, handler, nats.UserInfo("auth", "pwd"))
+	defer at.Cleanup()
+
+	acc := at.srv.globalAccount()
+	handlers := func() int {
+		acc.crMu.RLock()
+		defer acc.crMu.RUnlock()
+		return len(acc.crHandlers)
+	}
+	// What is subscribed before any user connects, with the callout service's own subscription registered.
+	require_NoError(t, at.authClient.Flush())
+	base := acc.sl.Count()
+
+	const n = 50
+	var wg sync.WaitGroup
+	var ok, denied atomic.Int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			pass := "zzz"
+			if i%5 == 0 {
+				pass = "bad"
+			}
+			nc, err := nats.Connect(at.srv.ClientURL(), nats.UserInfo("dlc", pass), nats.NoReconnect())
+			if err != nil {
+				denied.Add(1)
+				return
+			}
+			ok.Add(1)
+			nc.Close()
+		}(i)
+	}
+	wg.Wait()
+	require_Equal(t, ok.Load(), int32(n-n/5))
+	require_Equal(t, denied.Load(), int32(n/5))
+	require_Equal(t, atomic.LoadUint32(&callouts), uint32(n))
+
+	// One shared subscription was added for all of them, and no handler is left.
+	require_Equal(t, acc.sl.Count(), base+1)
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if h := handlers(); h != 0 {
+			return fmt.Errorf("%d reply handlers still registered", h)
+		}
+		return nil
+	})
+
+	// Replace the account's internal client, which drops the shared subscription. The next
+	// request must make a new one and still be answered.
+	acc.removeAllServiceImportSubs()
+	nc, err := nats.Connect(at.srv.ClientURL(), nats.UserInfo("dlc", "zzz"), nats.NoReconnect())
+	require_NoError(t, err)
+	nc.Close()
+	require_Equal(t, handlers(), 0)
+}

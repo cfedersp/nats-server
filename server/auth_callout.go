@@ -104,6 +104,7 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 		return false, errStr
 	}
 	reply := s.newRespInbox()
+	replyMux := s.sys.inboxPre
 	s.mu.RUnlock()
 	respCh := make(chan string, 1)
 	var replied atomic.Bool
@@ -374,14 +375,15 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 		respCh <- _EMPTY_
 	}
 
-	// create a subscription to receive a response from the authcallout
-	sub, err := acc.subscribeInternal(reply, processReply)
-	if err != nil {
+	// Register to receive a response from the authcallout. All of an account's
+	// pending requests share one wildcard subscription, so a connection does not
+	// add and remove a subscription (and its route, gateway and leafnode interest).
+	if err := acc.addCalloutReply(reply, replyMux, processReply); err != nil {
 		errStr = fmt.Sprintf("Error setting up reply subscription for auth request: %v", err)
 		s.Warnf(errStr)
 		return false, errStr
 	}
-	defer acc.unsubscribeInternal(sub)
+	defer acc.removeCalloutReply(reply)
 
 	// Build our request claims - jwt subject should be nkey
 	jwtSub := acc.Name
@@ -561,5 +563,59 @@ func (c *client) fillConnectOpts(opts *jwt.ConnectOptions, ujwt string) {
 		Lang:        o.Lang,
 		Version:     o.Version,
 		Protocol:    o.Protocol,
+	}
+}
+
+// addCalloutReply registers cb for the reply subject of one auth callout request on
+// this account. The replies of every request multiplex under the single wildcard
+// subscription muxSubject (the server's inbox response subject, as used for
+// replies to other internal requests), which is created on first use. Pair every
+// call with removeCalloutReply.
+func (a *Account) addCalloutReply(reply, muxSubject string, cb msgHandler) error {
+	a.mu.Lock()
+	ic := a.internalClient()
+	a.mu.Unlock()
+	if ic == nil {
+		return errors.New("no internal account client")
+	}
+
+	// The internal client is replaced when the account's service imports are reset,
+	// which closes it and drops its subscriptions, so a subscription on any other
+	// client than the current one has to be made again.
+	a.crSubMu.Lock()
+	if a.crSub == nil || a.crIC != ic {
+		sub, err := a.subscribeInternal(muxSubject, a.calloutReplyMux)
+		if err != nil {
+			a.crSubMu.Unlock()
+			return err
+		}
+		a.crSub, a.crIC = sub, ic
+	}
+	a.crSubMu.Unlock()
+
+	a.crMu.Lock()
+	if a.crHandlers == nil {
+		a.crHandlers = make(map[string]msgHandler)
+	}
+	a.crHandlers[reply] = cb
+	a.crMu.Unlock()
+	return nil
+}
+
+// removeCalloutReply drops the handler registered by addCalloutReply.
+func (a *Account) removeCalloutReply(reply string) {
+	a.crMu.Lock()
+	delete(a.crHandlers, reply)
+	a.crMu.Unlock()
+}
+
+// calloutReplyMux hands a reply to the handler registered for its subject. A reply
+// that no one is waiting for (late, or duplicated) is dropped.
+func (a *Account) calloutReplyMux(sub *subscription, c *client, acc *Account, subject, reply string, msg []byte) {
+	a.crMu.RLock()
+	cb := a.crHandlers[subject]
+	a.crMu.RUnlock()
+	if cb != nil {
+		cb(sub, c, acc, subject, reply, msg)
 	}
 }
