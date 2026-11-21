@@ -69,6 +69,11 @@ type Account struct {
 	cmu          sync.Mutex // serializes claim updates
 	sl           *Sublist
 	ic           *client
+	crSubMu      sync.Mutex // serializes creating the auth callout reply subscription
+	crSub        *subscription
+	crIC         *client // the internal client crSub was created on
+	crMu         sync.RWMutex
+	crHandlers   map[string]msgHandler // auth callout reply subject -> handler
 	sq           *sendq
 	isid         uint64
 	etmr         *time.Timer
